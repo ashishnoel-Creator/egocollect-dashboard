@@ -5,6 +5,7 @@ import shutil
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
@@ -12,10 +13,15 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from .config import SSD_FULL_THRESHOLD_PERCENT
 from .copier import run_copy_batch, write_checksums_file
+from .device_info import DriveInfo, get_drive_info
 from .devices import VolumeInfo
-from .ledger import record_ssd_snapshot
-from .manifest import append_session, ensure_manifest
+from .ledger import find_by_identity, record_ssd_snapshot
+from .manifest import (
+    append_event, append_session, load_manifest, migrate_manifest,
+    new_manifest, save_manifest,
+)
 from .models import CameraPosition, CollectionMode, SessionRecord
+from .naming import generate_assigned_name
 from .paths import next_session_number, session_folder
 from .reports import write_date_csv, write_summary_csv
 from .scanner import scan_sd_for_mp4
@@ -28,6 +34,54 @@ STATUS_DONE_PENDING_CLEAR = "done_pending_clear"
 STATUS_CLEARED = "cleared"
 STATUS_DONE_NO_CLEAR = "done_no_clear"
 STATUS_FAILED = "failed"
+
+
+class RegistrationAction(str, Enum):
+    NEW = "new"
+    POST_REFORMAT = "post_reformat"
+    RECONNECT = "reconnect"
+
+
+@dataclass
+class SSDInspection:
+    volume: VolumeInfo
+    drive_info: DriveInfo
+    existing_manifest: dict | None
+    prior_ledger_entry: dict | None
+    proposed_name: str
+
+    @property
+    def action(self) -> RegistrationAction:
+        if self.existing_manifest and self.existing_manifest.get("assigned_name"):
+            return RegistrationAction.RECONNECT
+        if self.prior_ledger_entry and self.prior_ledger_entry.get("assigned_name"):
+            return RegistrationAction.POST_REFORMAT
+        return RegistrationAction.NEW
+
+    @property
+    def existing_name(self) -> str | None:
+        if self.existing_manifest:
+            return self.existing_manifest.get("assigned_name")
+        if self.prior_ledger_entry:
+            return self.prior_ledger_entry.get("assigned_name")
+        return None
+
+
+def inspect_ssd(volume: VolumeInfo) -> SSDInspection:
+    drive_info = get_drive_info(volume.path)
+    manifest = load_manifest(volume.path)
+    prior = None
+    if not manifest:
+        ident = drive_info.identity_key()
+        if ident:
+            prior = find_by_identity(ident)
+    return SSDInspection(
+        volume=volume,
+        drive_info=drive_info,
+        existing_manifest=manifest or None,
+        prior_ledger_entry=prior,
+        proposed_name=generate_assigned_name(drive_info.total_bytes or volume.total_bytes),
+    )
 
 
 @dataclass
@@ -102,6 +156,8 @@ class AppState(QObject):
     def __init__(self):
         super().__init__()
         self.ssd_info: VolumeInfo | None = None
+        self.ssd_drive_info: DriveInfo | None = None
+        self.ssd_assigned_name: str | None = None
         self.instances: dict[str, CopyInstance] = {}
         self._sds_in_use: set[str] = set()
         self._workers: dict[str, _CopyWorker] = {}
@@ -110,15 +166,58 @@ class AppState(QObject):
     def sds_in_use(self) -> set[str]:
         return set(self._sds_in_use)
 
-    def lock_ssd(self, info: VolumeInfo) -> None:
-        self.ssd_info = info
-        ensure_manifest(info.path, logical_name=info.label)
+    def register_or_reconnect_ssd(
+        self, inspection: SSDInspection, confirmed_name: str,
+    ) -> None:
+        vol = inspection.volume
+        drive_info = inspection.drive_info
+        manifest = inspection.existing_manifest
+
+        if inspection.action == RegistrationAction.RECONNECT and manifest:
+            manifest = migrate_manifest(manifest, drive_info)
+            save_manifest(vol.path, manifest)
+            append_event(vol.path, "reconnected", {
+                "mount_point": str(vol.path),
+                "assigned_name": manifest.get("assigned_name"),
+            })
+        else:
+            manifest = new_manifest(drive_info, confirmed_name)
+            if inspection.action == RegistrationAction.POST_REFORMAT:
+                if inspection.prior_ledger_entry:
+                    manifest["ssd_uuid"] = inspection.prior_ledger_entry.get(
+                        "ssd_uuid", manifest["ssd_uuid"],
+                    )
+                    manifest["registered_at"] = inspection.prior_ledger_entry.get(
+                        "registered_at", manifest["registered_at"],
+                    )
+            save_manifest(vol.path, manifest)
+            event_type = (
+                "restored_after_reformat"
+                if inspection.action == RegistrationAction.POST_REFORMAT
+                else "registered"
+            )
+            append_event(vol.path, event_type, {
+                "assigned_name": confirmed_name,
+                "serial_number": drive_info.serial_number,
+                "volume_uuid": drive_info.volume_uuid,
+                "total_bytes": drive_info.total_bytes,
+                "mount_point": str(vol.path),
+            })
+
+        manifest = load_manifest(vol.path)
+        record_ssd_snapshot(manifest, vol.path)
+
+        self.ssd_info = vol
+        self.ssd_drive_info = drive_info
+        self.ssd_assigned_name = manifest.get("assigned_name")
         self.ssd_changed.emit()
 
     def unlock_ssd(self) -> None:
         if self.has_active_instances():
             raise RuntimeError("Cannot unlock SSD while copies are running.")
         self.ssd_info = None
+        self.ssd_drive_info = None
+        self.ssd_assigned_name = None
         self.ssd_changed.emit()
 
     def has_active_instances(self) -> bool:
@@ -209,6 +308,63 @@ class AppState(QObject):
         self.instances.pop(inst_id, None)
         self._workers.pop(inst_id, None)
         self.instance_removed.emit(inst_id)
+
+    def clear_ssd_data(self) -> dict:
+        """Wipe session folders on the currently locked SSD, preserving the
+        manifest identity. Returns a summary of what was deleted.
+        """
+        if not self.ssd_info:
+            raise RuntimeError("No SSD is locked.")
+        if self.has_active_instances():
+            raise RuntimeError("Finish active copies before clearing the SSD.")
+
+        ssd_root = self.ssd_info.path
+        manifest_before = load_manifest(ssd_root)
+
+        bytes_deleted = 0
+        files_deleted = 0
+        sessions_deleted = len(manifest_before.get("sessions", []))
+        dates_deleted: set[str] = set()
+        modes_deleted: set[str] = set()
+        for entry in list(ssd_root.iterdir()):
+            if entry.name.startswith("."):
+                continue
+            if entry.name == "reports":
+                continue
+            if not entry.is_dir():
+                continue
+            if _looks_like_date(entry.name):
+                dates_deleted.add(entry.name)
+            for path in entry.rglob("*"):
+                if path.is_file():
+                    try:
+                        bytes_deleted += path.stat().st_size
+                        files_deleted += 1
+                    except OSError:
+                        pass
+            shutil.rmtree(entry, ignore_errors=True)
+
+        for s in manifest_before.get("sessions", []):
+            modes_deleted.add(s.get("mode", ""))
+
+        reports_dir = ssd_root / "reports"
+        if reports_dir.exists():
+            shutil.rmtree(reports_dir, ignore_errors=True)
+
+        manifest_before["sessions"] = []
+        save_manifest(ssd_root, manifest_before)
+        summary = {
+            "files_deleted": files_deleted,
+            "bytes_deleted": bytes_deleted,
+            "sessions_deleted": sessions_deleted,
+            "dates_deleted": sorted(dates_deleted),
+            "modes_deleted": sorted(m for m in modes_deleted if m),
+            "cleared_at": datetime.now(timezone.utc).isoformat(),
+        }
+        append_event(ssd_root, "ssd_cleared", summary)
+        manifest_after = load_manifest(ssd_root)
+        record_ssd_snapshot(manifest_after, ssd_root)
+        return summary
 
     def _register_sds(self, paths: Iterable[Path]) -> None:
         for p in paths:
@@ -318,6 +474,11 @@ def _clear_dcim_contents(sd_root: Path) -> int:
             except OSError:
                 pass
     return removed
+
+
+def _looks_like_date(name: str) -> bool:
+    import re
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", name))
 
 
 def _human(n: float) -> str:

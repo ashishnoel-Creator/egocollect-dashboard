@@ -6,9 +6,9 @@ from PyQt6.QtWidgets import QMainWindow, QMessageBox, QTabWidget, QVBoxLayout, Q
 from ingest.state import AppState
 from ingest.updater import UpdateInfo, check_for_update, check_for_update_async
 from ingest.version import GITHUB_REPO, VERSION
+from ui.admin_view import AdminView
 from ui.dashboard_view import DashboardView
 from ui.ingest_view import IngestView
-from ui.settings_view import SettingsView
 from ui.update_banner import UpdateBanner
 
 
@@ -16,7 +16,7 @@ class MainWindow(QMainWindow):
     def __init__(self, app_state: AppState) -> None:
         super().__init__()
         self.setWindowTitle(f"EgoCollect  ·  v{VERSION}")
-        self.resize(1100, 840)
+        self.resize(1100, 860)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -29,7 +29,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(IngestView(app_state), "Ingest")
         tabs.addTab(DashboardView(app_state), "Dashboard")
-        tabs.addTab(SettingsView(), "Settings")
+        tabs.addTab(AdminView(app_state), "Admin")
         layout.addWidget(tabs, 1)
 
         self.setCentralWidget(central)

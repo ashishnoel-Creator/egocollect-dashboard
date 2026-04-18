@@ -57,7 +57,7 @@ class DashboardView(QWidget):
         ssd_count = 0
         for ssd_uuid, ssd in ledger.get("ssds", {}).items():
             ssd_count += 1
-            ssd_name = ssd.get("logical_name") or ssd_uuid
+            ssd_name = ssd.get("assigned_name") or ssd.get("logical_name") or ssd_uuid
             for s in ssd.get("sessions", []):
                 total_files += s.get("file_count", 0)
                 total_bytes += s.get("total_bytes", 0)

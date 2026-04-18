@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PyQt6.QtCore import QDate, Qt
 from PyQt6.QtWidgets import (
-    QComboBox, QDateEdit, QFormLayout, QGroupBox,
+    QComboBox, QDateEdit, QDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar,
     QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from ingest.devices import has_dcim
 from ingest.models import CameraPosition, CollectionMode
-from ingest.state import AppState
+from ingest.state import AppState, RegistrationAction, inspect_ssd
 from ui.instance_card import InstanceCard
+from ui.ssd_registration_dialog import SSDRegistrationDialog
 from ui.volume_picker import VolumePickerDialog
 
 
@@ -23,6 +25,10 @@ def _human(n: float) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
+
+
+_STALE_DAYS_THRESHOLD = 1
+_STALE_FULL_PCT_THRESHOLD = 90.0
 
 
 class SDField(QWidget):
@@ -97,7 +103,7 @@ class SSDPanel(QGroupBox):
         heading.setObjectName("TitleLabel")
         sub = QLabel(
             "Plug in an external SSD and lock it as the destination. "
-            "It stays the destination for every copy until it's full."
+            "It stays the destination for every copy until it fills up."
         )
         sub.setObjectName("SubtitleLabel")
         sub.setWordWrap(True)
@@ -122,11 +128,18 @@ class SSDPanel(QGroupBox):
         name_col = QVBoxLayout()
         name_col.setSpacing(2)
         self.name_label = QLabel()
-        self.name_label.setObjectName("TitleLabel")
+        self.name_label.setStyleSheet(
+            "font-size: 16px; font-weight: 700; color: #111827; "
+            "font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;"
+        )
+        self.name_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.path_label = QLabel()
         self.path_label.setObjectName("SubtitleLabel")
+        self.serial_label = QLabel()
+        self.serial_label.setObjectName("MutedLabel")
         name_col.addWidget(self.name_label)
         name_col.addWidget(self.path_label)
+        name_col.addWidget(self.serial_label)
         top_row.addLayout(name_col, 1)
         self.lock_chip = QLabel("LOCKED")
         self.lock_chip.setStyleSheet(
@@ -147,6 +160,10 @@ class SSDPanel(QGroupBox):
         ll.addWidget(self.free_text)
 
         hrow = QHBoxLayout()
+        self.clear_ssd_btn = QPushButton("Clear SSD…")
+        self.clear_ssd_btn.clicked.connect(self._clear_ssd)
+        self.clear_ssd_btn.hide()
+        hrow.addWidget(self.clear_ssd_btn)
         hrow.addStretch()
         self.change_btn = QPushButton("Unlock SSD…")
         self.change_btn.clicked.connect(self._unlock)
@@ -172,7 +189,19 @@ class SSDPanel(QGroupBox):
             )
             if confirm != QMessageBox.StandardButton.Yes:
                 return
-        self.app_state.lock_ssd(vol)
+
+        inspection = inspect_ssd(vol)
+        if inspection.action == RegistrationAction.RECONNECT:
+            self.app_state.register_or_reconnect_ssd(
+                inspection, inspection.existing_name or inspection.proposed_name,
+            )
+            return
+
+        dlg = SSDRegistrationDialog(inspection, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = dlg.confirmed_name() or inspection.proposed_name
+        self.app_state.register_or_reconnect_ssd(inspection, name)
 
     def _unlock(self) -> None:
         if self.app_state.has_active_instances():
@@ -189,6 +218,39 @@ class SSDPanel(QGroupBox):
         if confirm == QMessageBox.StandardButton.Yes:
             self.app_state.unlock_ssd()
 
+    def _clear_ssd(self) -> None:
+        if not self.app_state.ssd_info:
+            return
+        name = self.app_state.ssd_assigned_name or self.app_state.ssd_info.label
+        confirm = QMessageBox.warning(
+            self, "Clear all data on this SSD?",
+            f"This will delete every session folder on {name} but preserve its "
+            "registered identity (name, serial number, event log).\n\n"
+            "Data deleted: every dated folder and its session files, plus the "
+            "reports directory. The manifest file is kept.\n\n"
+            "This cannot be undone. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            summary = self.app_state.clear_ssd_data()
+        except RuntimeError as exc:
+            QMessageBox.critical(self, "Cannot clear", str(exc))
+            return
+
+        QMessageBox.information(
+            self, "SSD cleared",
+            f"{summary['files_deleted']} files ({_human(summary['bytes_deleted'])}) "
+            f"across {summary['sessions_deleted']} session(s) deleted.\n\n"
+            f"Dates: {', '.join(summary['dates_deleted']) or '—'}\n"
+            f"Modes: {', '.join(summary['modes_deleted']) or '—'}\n\n"
+            f"Identity preserved: {name}",
+        )
+        self._refresh()
+
     def _refresh(self) -> None:
         info = self.app_state.ssd_info
         if info is None:
@@ -199,21 +261,51 @@ class SSDPanel(QGroupBox):
             usage = shutil.disk_usage(info.path)
         except OSError:
             usage = None
-        self.name_label.setText(info.label)
+
+        name = self.app_state.ssd_assigned_name or info.label
+        self.name_label.setText(name)
         self.path_label.setText(str(info.path))
+        drive = self.app_state.ssd_drive_info
+        if drive and drive.serial_number:
+            self.serial_label.setText(f"Serial: {drive.serial_number}")
+        else:
+            self.serial_label.setText("Serial: not detected")
+
         if usage and usage.total:
             pct_used = int(100.0 * (usage.total - usage.free) / usage.total)
             self.free_bar.setValue(pct_used)
             self.free_text.setText(
                 f"{_human(usage.free)} free of {_human(usage.total)}"
             )
+            show_clear = (
+                pct_used >= _STALE_FULL_PCT_THRESHOLD
+                and self._is_ssd_stale()
+                and not self.app_state.has_active_instances()
+            )
+            self.clear_ssd_btn.setVisible(show_clear)
         self.change_btn.setEnabled(not self.app_state.has_active_instances())
+
+    def _is_ssd_stale(self) -> bool:
+        from ingest.manifest import load_manifest
+        if not self.app_state.ssd_info:
+            return False
+        manifest = load_manifest(self.app_state.ssd_info.path)
+        last = manifest.get("last_updated")
+        if not last:
+            return True
+        try:
+            dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        age = datetime.now(timezone.utc) - dt
+        return age.days >= _STALE_DAYS_THRESHOLD
 
     def _warn_full(self, pct_free: float) -> None:
         QMessageBox.warning(
             self, "SSD nearly full",
             f"Only {pct_free:.1f}% free on this SSD. "
-            "When current copies finish, unlock and connect a new SSD.",
+            "When current copies finish, unlock and connect a new SSD "
+            "(or clear this one for reuse from the destination panel).",
         )
 
 
