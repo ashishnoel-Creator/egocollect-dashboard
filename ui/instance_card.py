@@ -63,6 +63,7 @@ class InstanceCard(QFrame):
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False)
+        self.progress_bar.setRange(0, 1000)
         layout.addWidget(self.progress_bar)
 
         self.progress_text = QLabel()
@@ -77,6 +78,7 @@ class InstanceCard(QFrame):
         actions.setSpacing(8)
         self.details_btn = QPushButton("Show log")
         self.details_btn.setCheckable(True)
+        self.details_btn.setChecked(True)
         self.details_btn.toggled.connect(self._toggle_log)
         self.clear_yes_btn = QPushButton("Clear SD card(s) now")
         self.clear_yes_btn.setObjectName("PrimaryButton")
@@ -95,9 +97,9 @@ class InstanceCard(QFrame):
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMaximumHeight(180)
-        self.log_view.hide()
+        self.log_view.setMaximumHeight(220)
         layout.addWidget(self.log_view)
+        self._toggle_log(True)
 
     def _maybe_refresh(self, inst_id: str) -> None:
         if inst_id == self.inst_id:
@@ -116,16 +118,16 @@ class InstanceCard(QFrame):
             source_parts.append(f"{label}: {sd.name}")
         self.sd_label.setText("   •   ".join(source_parts))
 
-        self.progress_bar.setMaximum(max(inst.total_files, 1))
-        self.progress_bar.setValue(inst.done_files)
-        if inst.total_files > 0:
-            pct = 100.0 * inst.done_files / inst.total_files
-            self.progress_text.setText(
-                f"{inst.done_files} / {inst.total_files} files   ·   "
-                f"{pct:.0f}%   ·   {_human(inst.total_bytes)}"
-            )
+        if inst.total_bytes > 0:
+            pct = min(100.0, 100.0 * inst.done_bytes / inst.total_bytes)
+            self.progress_bar.setValue(int(pct * 10))
         else:
-            self.progress_text.setText("")
+            self.progress_bar.setValue(0)
+
+        self.progress_text.setText(
+            f"{_human(inst.done_bytes)} / {_human(inst.total_bytes)}   ·   "
+            f"files: {inst.done_files} / {inst.total_files}"
+        )
 
         self.status_label.setText(_STATUS_LABEL.get(inst.status, inst.status.upper()))
         self.status_label.setStyleSheet(status_chip_stylesheet(inst.status))
@@ -146,7 +148,7 @@ class InstanceCard(QFrame):
         elif inst.status == STATUS_FAILED:
             self.message_label.setText(
                 f"Failed: {inst.error or 'unknown error'}. "
-                "SD card(s) not cleared; session folder kept on SSD."
+                "SD card(s) not cleared; data on SSD kept."
             )
         else:
             self.message_label.setText("")
@@ -157,7 +159,12 @@ class InstanceCard(QFrame):
         self.remove_btn.setVisible(not inst.is_active() and not pending)
 
         if self.log_view.isVisible():
-            self.log_view.setPlainText("\n".join(inst.log_lines[-200:]))
+            text = "\n".join(inst.log_lines[-400:])
+            if self.log_view.toPlainText() != text:
+                self.log_view.setPlainText(text)
+                cursor = self.log_view.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                self.log_view.setTextCursor(cursor)
 
     def _toggle_log(self, on: bool) -> None:
         self.log_view.setVisible(on)
@@ -165,7 +172,7 @@ class InstanceCard(QFrame):
         if on:
             inst = self.app_state.instances.get(self.inst_id)
             if inst:
-                self.log_view.setPlainText("\n".join(inst.log_lines[-200:]))
+                self.log_view.setPlainText("\n".join(inst.log_lines[-400:]))
 
     def _on_clear_yes(self) -> None:
         confirm = QMessageBox.question(

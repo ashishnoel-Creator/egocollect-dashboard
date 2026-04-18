@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import shutil
+import socket
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -15,6 +15,8 @@ from .config import SSD_FULL_THRESHOLD_PERCENT
 from .copier import run_copy_batch, write_checksums_file
 from .device_info import DriveInfo, get_drive_info
 from .devices import VolumeInfo
+from .drive_sync import DriveSync
+from .folder_info import update_folder_info
 from .ledger import find_by_identity, record_ssd_snapshot
 from .manifest import (
     append_event, append_session, load_manifest, migrate_manifest,
@@ -22,7 +24,9 @@ from .manifest import (
 )
 from .models import CameraPosition, CollectionMode, SessionRecord
 from .naming import generate_assigned_name
-from .paths import next_session_number, session_folder
+from .paths import (
+    MODE_FOLDERS, copy_ordinal_for, emp_folder, ensure_mode_folders,
+)
 from .reports import write_date_csv, write_summary_csv
 from .scanner import scan_sd_for_mp4
 
@@ -93,11 +97,12 @@ class CopyInstance:
     task_type: str
     sd_sources: list[tuple[Path, CameraPosition | None]]
     ssd_root: Path
-    session_dir: Path
-    session_number: int
+    emp_folder: Path
+    copy_ordinal: int
     total_files: int
     total_bytes: int
     done_files: int = 0
+    done_bytes: int = 0
     status: str = STATUS_PREPARING
     log_lines: list[str] = field(default_factory=list)
     results: list = field(default_factory=list)
@@ -106,20 +111,21 @@ class CopyInstance:
     def title(self) -> str:
         mode_label = "single-cam" if self.mode == CollectionMode.SINGLE else "3-cam"
         return (
-            f"Session {self.session_number:03d}  ·  "
-            f"{self.employee_id}  ·  {self.task_type}  ·  "
-            f"{self.collection_date}  ·  {mode_label}"
+            f"{mode_label}  ·  {self.collection_date}  ·  "
+            f"{self.task_type}  ·  {self.employee_id}  ·  "
+            f"copy #{self.copy_ordinal}"
         )
 
     def is_active(self) -> bool:
         return self.status in (STATUS_PREPARING, STATUS_RUNNING, STATUS_FINALIZING)
 
     def target_dir(self, position: CameraPosition | None) -> Path:
-        return self.session_dir if position is None else self.session_dir / position.value
+        return self.emp_folder if position is None else self.emp_folder / position.value
 
 
 class _CopyWorker(QThread):
     progress_signal = pyqtSignal(str, str, int, int)
+    bytes_signal = pyqtSignal(str, int, int)
     completed_signal = pyqtSignal(str, list)
     failed_signal = pyqtSignal(str, str)
 
@@ -139,7 +145,12 @@ class _CopyWorker(QThread):
                     done, total,
                 )
 
-            results = run_copy_batch(self.pairs, progress=_on_progress)
+            def _on_bytes(done, total):
+                self.bytes_signal.emit(self.inst_id, done, total)
+
+            results = run_copy_batch(
+                self.pairs, progress=_on_progress, bytes_progress=_on_bytes,
+            )
             self.completed_signal.emit(self.inst_id, results)
         except Exception as exc:
             self.failed_signal.emit(self.inst_id, str(exc))
@@ -161,6 +172,10 @@ class AppState(QObject):
         self.instances: dict[str, CopyInstance] = {}
         self._sds_in_use: set[str] = set()
         self._workers: dict[str, _CopyWorker] = {}
+        self.drive_sync: DriveSync | None = None
+
+    def attach_drive_sync(self, ds: DriveSync) -> None:
+        self.drive_sync = ds
 
     @property
     def sds_in_use(self) -> set[str]:
@@ -204,8 +219,20 @@ class AppState(QObject):
                 "mount_point": str(vol.path),
             })
 
+        ensure_mode_folders(vol.path)
+
         manifest = load_manifest(vol.path)
         record_ssd_snapshot(manifest, vol.path)
+
+        if self.drive_sync:
+            self.drive_sync.push_ssd(manifest)
+            last = (manifest.get("events") or [{}])[-1]
+            self.drive_sync.push_event(
+                last.get("type", "connected"),
+                manifest.get("ssd_uuid", ""),
+                manifest.get("assigned_name", ""),
+                last.get("data", {}),
+            )
 
         self.ssd_info = vol
         self.ssd_drive_info = drive_info
@@ -235,8 +262,15 @@ class AppState(QObject):
             raise RuntimeError("No destination SSD is locked.")
         ssd_root = self.ssd_info.path
 
-        sess_n = next_session_number(ssd_root, mode, collection_date, employee_id, task_type)
-        sess_dir = session_folder(ssd_root, mode, collection_date, employee_id, task_type, sess_n)
+        manifest = load_manifest(ssd_root)
+        ordinal = copy_ordinal_for(
+            manifest.get("sessions", []),
+            mode, collection_date, task_type, employee_id,
+        )
+        target_emp = emp_folder(
+            ssd_root, mode, collection_date, task_type, employee_id,
+        )
+        target_emp.mkdir(parents=True, exist_ok=True)
 
         pairs: list[tuple[Path, Path]] = []
         total_files = 0
@@ -245,7 +279,7 @@ class AppState(QObject):
             scan = scan_sd_for_mp4(sd)
             if scan.count == 0:
                 raise ValueError(f"No .MP4 files found under {sd}/DCIM.")
-            target_dir = sess_dir if pos is None else sess_dir / pos.value
+            target_dir = target_emp if pos is None else target_emp / pos.value
             target_dir.mkdir(parents=True, exist_ok=True)
             total_files += scan.count
             total_bytes += scan.total_bytes
@@ -268,11 +302,15 @@ class AppState(QObject):
             task_type=task_type,
             sd_sources=sd_sources,
             ssd_root=ssd_root,
-            session_dir=sess_dir,
-            session_number=sess_n,
+            emp_folder=target_emp,
+            copy_ordinal=ordinal,
             total_files=total_files,
             total_bytes=total_bytes,
             status=STATUS_RUNNING,
+        )
+        inst.log_lines.append(
+            f"Starting copy of {total_files} files ({_human(total_bytes)}) "
+            f"into {target_emp}"
         )
         self.instances[inst_id] = inst
         self._register_sds([sd for sd, _ in sd_sources])
@@ -280,6 +318,7 @@ class AppState(QObject):
 
         worker = _CopyWorker(inst_id, pairs)
         worker.progress_signal.connect(self._on_worker_progress)
+        worker.bytes_signal.connect(self._on_worker_bytes)
         worker.completed_signal.connect(self._on_worker_completed)
         worker.failed_signal.connect(self._on_worker_failed)
         self._workers[inst_id] = worker
@@ -310,8 +349,8 @@ class AppState(QObject):
         self.instance_removed.emit(inst_id)
 
     def clear_ssd_data(self) -> dict:
-        """Wipe session folders on the currently locked SSD, preserving the
-        manifest identity. Returns a summary of what was deleted.
+        """Wipe everything inside the two mode folders. Preserve mode folders,
+        manifest, reports, and SSD identity. Logs an `ssd_cleared` event.
         """
         if not self.ssd_info:
             raise RuntimeError("No SSD is locked.")
@@ -324,46 +363,64 @@ class AppState(QObject):
         bytes_deleted = 0
         files_deleted = 0
         sessions_deleted = len(manifest_before.get("sessions", []))
-        dates_deleted: set[str] = set()
-        modes_deleted: set[str] = set()
-        for entry in list(ssd_root.iterdir()):
-            if entry.name.startswith("."):
+        dates_seen: set[str] = set()
+        modes_seen: set[str] = set()
+        emp_seen: set[str] = set()
+
+        for mode_name in MODE_FOLDERS:
+            mode_dir = ssd_root / mode_name
+            if not mode_dir.is_dir():
                 continue
-            if entry.name == "reports":
-                continue
-            if not entry.is_dir():
-                continue
-            if _looks_like_date(entry.name):
-                dates_deleted.add(entry.name)
-            for path in entry.rglob("*"):
-                if path.is_file():
+            for child in list(mode_dir.iterdir()):
+                if child.is_dir() and _looks_like_date(child.name):
+                    dates_seen.add(child.name)
+                if child.is_dir():
+                    for sub in child.iterdir():
+                        if sub.is_dir():
+                            for emp in sub.iterdir():
+                                if emp.is_dir():
+                                    emp_seen.add(emp.name)
+                for path in child.rglob("*"):
+                    if path.is_file():
+                        try:
+                            bytes_deleted += path.stat().st_size
+                            files_deleted += 1
+                        except OSError:
+                            pass
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
                     try:
-                        bytes_deleted += path.stat().st_size
-                        files_deleted += 1
+                        child.unlink()
                     except OSError:
                         pass
-            shutil.rmtree(entry, ignore_errors=True)
-
-        for s in manifest_before.get("sessions", []):
-            modes_deleted.add(s.get("mode", ""))
-
-        reports_dir = ssd_root / "reports"
-        if reports_dir.exists():
-            shutil.rmtree(reports_dir, ignore_errors=True)
+            modes_seen.add(mode_name)
 
         manifest_before["sessions"] = []
         save_manifest(ssd_root, manifest_before)
         summary = {
             "files_deleted": files_deleted,
             "bytes_deleted": bytes_deleted,
+            "gb_deleted": round(bytes_deleted / (1000 ** 3), 3),
             "sessions_deleted": sessions_deleted,
-            "dates_deleted": sorted(dates_deleted),
-            "modes_deleted": sorted(m for m in modes_deleted if m),
+            "dates_deleted": sorted(dates_seen),
+            "modes_deleted": sorted(modes_seen),
+            "employees_deleted": sorted(emp_seen),
             "cleared_at": datetime.now(timezone.utc).isoformat(),
+            "machine": _machine(),
         }
         append_event(ssd_root, "ssd_cleared", summary)
         manifest_after = load_manifest(ssd_root)
         record_ssd_snapshot(manifest_after, ssd_root)
+
+        if self.drive_sync:
+            self.drive_sync.push_ssd(manifest_after)
+            self.drive_sync.push_event(
+                "ssd_cleared",
+                manifest_after.get("ssd_uuid", ""),
+                manifest_after.get("assigned_name", ""),
+                summary,
+            )
         return summary
 
     def _register_sds(self, paths: Iterable[Path]) -> None:
@@ -382,6 +439,15 @@ class AppState(QObject):
             return
         inst.done_files = done
         inst.log_lines.append(line)
+        self.instance_changed.emit(inst_id)
+
+    def _on_worker_bytes(self, inst_id: str, done: int, total: int) -> None:
+        inst = self.instances.get(inst_id)
+        if not inst:
+            return
+        inst.done_bytes = done
+        if total and total != inst.total_bytes:
+            inst.total_bytes = total
         self.instance_changed.emit(inst_id)
 
     def _on_worker_completed(self, inst_id: str, results: list) -> None:
@@ -405,21 +471,25 @@ class AppState(QObject):
             per = [r for r in results if r.destination.parent == target_dir]
             write_checksums_file(per, target_dir / "checksums.sha256")
 
-        metadata = {
-            "mode": inst.mode.value,
-            "collection_date": inst.collection_date,
-            "employee_id": inst.employee_id,
-            "task_type": inst.task_type,
-            "session_number": inst.session_number,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "sources": [
-                {"path": str(sd), "position": pos.value if pos else None}
-                for sd, pos in inst.sd_sources
-            ],
-            "file_count": len(results),
-            "total_bytes": sum(r.size_bytes for r in results),
-        }
-        (inst.session_dir / "session.json").write_text(json.dumps(metadata, indent=2))
+        is_three_cam = inst.mode == CollectionMode.THREE_CAM
+        info = update_folder_info(
+            emp_folder=inst.emp_folder,
+            mode=inst.mode.value,
+            collection_date=inst.collection_date,
+            task_type=inst.task_type,
+            employee_id=inst.employee_id,
+            ssd_assigned_name=self.ssd_assigned_name or "",
+            ssd_serial_number=(
+                self.ssd_drive_info.serial_number if self.ssd_drive_info else None
+            ),
+            machine=_machine(),
+            is_three_cam=is_three_cam,
+        )
+        inst.log_lines.append(
+            f"info.json updated  ·  total in folder: "
+            f"{info.get('file_count', 0)} files  ·  "
+            f"{info.get('total_gb', 0)} GB"
+        )
 
         manifest: dict = {}
         for sd, pos in inst.sd_sources:
@@ -430,7 +500,7 @@ class AppState(QObject):
                 mode=inst.mode.value,
                 employee_id=inst.employee_id,
                 task_type=inst.task_type,
-                session_number=inst.session_number,
+                session_number=inst.copy_ordinal,
                 position=pos.value if pos else None,
                 relative_path=str(target_dir.relative_to(inst.ssd_root)),
                 file_count=len(per),
@@ -442,6 +512,28 @@ class AppState(QObject):
         record_ssd_snapshot(manifest, inst.ssd_root)
         write_summary_csv(inst.ssd_root)
         write_date_csv(inst.ssd_root, inst.collection_date)
+
+        if self.drive_sync:
+            ssd_name = manifest.get("assigned_name", "")
+            ssd_uuid = manifest.get("ssd_uuid", "")
+            self.drive_sync.push_ssd(manifest)
+            for s in manifest.get("sessions", [])[-len(inst.sd_sources):]:
+                self.drive_sync.push_session(s, ssd_uuid, ssd_name)
+            self.drive_sync.push_event(
+                "copy_session", ssd_uuid, ssd_name,
+                {
+                    "copy_ordinal": inst.copy_ordinal,
+                    "collection_date": inst.collection_date,
+                    "mode": inst.mode.value,
+                    "employee_id": inst.employee_id,
+                    "task_type": inst.task_type,
+                    "file_count": len(results),
+                    "total_bytes": sum(r.size_bytes for r in results),
+                    "total_gb": round(
+                        sum(r.size_bytes for r in results) / (1000 ** 3), 3,
+                    ),
+                },
+            )
 
         inst.status = STATUS_DONE_PENDING_CLEAR
         self.instance_changed.emit(inst_id)
@@ -479,6 +571,13 @@ def _clear_dcim_contents(sd_root: Path) -> int:
 def _looks_like_date(name: str) -> bool:
     import re
     return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", name))
+
+
+def _machine() -> str:
+    try:
+        return socket.gethostname()
+    except Exception:
+        return "unknown"
 
 
 def _human(n: float) -> str:

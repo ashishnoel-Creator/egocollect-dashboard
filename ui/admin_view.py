@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices
-from PyQt6.QtCore import QUrl
 from PyQt6.QtWidgets import (
     QGroupBox, QHBoxLayout, QLabel, QPushButton, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from ingest.drive_sync import sheet_url
 from ingest.ledger import load_ledger
 from ingest.state import AppState
 from ingest.version import GITHUB_REPO, VERSION
@@ -48,12 +48,9 @@ class AppInfoCard(QGroupBox):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
 
-        version_row = QHBoxLayout()
         version = QLabel(f"EgoCollect v{VERSION}")
         version.setObjectName("TitleLabel")
-        version_row.addWidget(version)
-        version_row.addStretch()
-        layout.addLayout(version_row)
+        layout.addWidget(version)
 
         repo_label = QLabel(
             f'Source & updates: <a href="https://github.com/{GITHUB_REPO}">'
@@ -73,6 +70,89 @@ class AppInfoCard(QGroupBox):
     def _open_support_dir(self):
         from ingest.config import app_paths
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(app_paths().support_dir)))
+
+
+class DriveSyncCard(QGroupBox):
+    def __init__(self, app_state: AppState):
+        super().__init__("Google Drive sync")
+        self.app_state = app_state
+        self._build()
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(2000)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start()
+        self._refresh()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        status_row = QHBoxLayout()
+        self.chip = QLabel("INITIALIZING")
+        self.chip.setStyleSheet(
+            "padding: 3px 10px; border-radius: 10px; "
+            "font-size: 11px; font-weight: 600; "
+            "background: #f3f4f6; color: #6b7280;"
+        )
+        status_row.addWidget(self.chip)
+        status_row.addStretch()
+        self.open_btn = QPushButton("Open Sheet")
+        self.open_btn.clicked.connect(self._open_sheet)
+        self.open_btn.setEnabled(False)
+        status_row.addWidget(self.open_btn)
+        layout.addLayout(status_row)
+
+        self.detail_label = QLabel()
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setObjectName("SubtitleLabel")
+        layout.addWidget(self.detail_label)
+
+    def _refresh(self):
+        ds = self.app_state.drive_sync
+        if ds is None:
+            self.chip.setText("CONNECTING")
+            self.chip.setStyleSheet(
+                "padding: 3px 10px; border-radius: 10px; "
+                "font-size: 11px; font-weight: 600; "
+                "background: #fef3c7; color: #92400e;"
+            )
+            self.detail_label.setText("Authenticating with Google Drive…")
+            self.open_btn.setEnabled(False)
+            return
+
+        if ds.status.available:
+            self.chip.setText("CONNECTED")
+            self.chip.setStyleSheet(
+                "padding: 3px 10px; border-radius: 10px; "
+                "font-size: 11px; font-weight: 600; "
+                "background: #d1fae5; color: #065f46;"
+            )
+            pending = ds.status.pending_jobs
+            last_sync = _relative_time(ds.status.last_sync_at)
+            extra = f"  ·  {pending} job(s) pending" if pending else ""
+            self.detail_label.setText(
+                f"Mirroring SSD registrations, copies, and clear events to "
+                f"<b>EgoCollect_Log</b>. Last sync: {last_sync}{extra}."
+            )
+            self.open_btn.setEnabled(True)
+        else:
+            self.chip.setText("UNAVAILABLE")
+            self.chip.setStyleSheet(
+                "padding: 3px 10px; border-radius: 10px; "
+                "font-size: 11px; font-weight: 600; "
+                "background: #fecaca; color: #991b1b;"
+            )
+            self.detail_label.setText(
+                f"Drive sync is offline: {ds.status.last_error or 'unknown error'}."
+            )
+            self.open_btn.setEnabled(False)
+
+    def _open_sheet(self):
+        ds = self.app_state.drive_sync
+        if ds and ds.status.spreadsheet_id:
+            QDesktopServices.openUrl(QUrl(sheet_url(ds.status.spreadsheet_id)))
 
 
 class SSDRegistryCard(QGroupBox):
@@ -133,10 +213,8 @@ class SSDRegistryCard(QGroupBox):
 
             if ssd_uuid == locked_uuid:
                 state = "CONNECTED"
-                state_color = "#d1fae5;color:#065f46"
             else:
                 state = "offline"
-                state_color = "#f3f4f6;color:#6b7280"
 
             total_sessions += session_count
             total_bytes += data_bytes
@@ -156,32 +234,15 @@ class SSDRegistryCard(QGroupBox):
                 if j == 0:
                     item.setData(Qt.ItemDataRole.UserRole, ssd_uuid)
                     font = item.font()
-                    font.setFamilies(["SF Mono", "Menlo", "Consolas", "monospace"])
+                    font.setFamilies(["Menlo", "Consolas", "monospace"])
                     item.setFont(font)
                 self.table.setItem(i, j, item)
 
         self.table.resizeColumnsToContents()
         self.summary_label.setText(
-            f"{len(ssds)} SSDs tracked  ·  {total_sessions} sessions  ·  "
+            f"{len(ssds)} SSDs tracked locally  ·  {total_sessions} sessions  ·  "
             f"{_human(total_bytes)} archived"
         )
-
-
-class DriveSyncCard(QGroupBox):
-    def __init__(self):
-        super().__init__("Google Drive sync")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(6)
-
-        status = QLabel(
-            "Drive sync is not configured yet. When enabled, each SSD "
-            "registration and clear event will be mirrored to a Google Sheet "
-            "for cross-team visibility. (Planned for Phase 4.)"
-        )
-        status.setObjectName("SubtitleLabel")
-        status.setWordWrap(True)
-        layout.addWidget(status)
 
 
 class AdminView(QWidget):
@@ -192,5 +253,5 @@ class AdminView(QWidget):
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(12)
         root.addWidget(AppInfoCard())
+        root.addWidget(DriveSyncCard(app_state))
         root.addWidget(SSDRegistryCard(app_state), 1)
-        root.addWidget(DriveSyncCard())

@@ -9,12 +9,17 @@ from pathlib import Path
 APP_NAME = "EgoCollect"
 ROOT = Path(SPECPATH).resolve()
 
+_secrets_dir = ROOT / "secrets"
+_datas = []
+if _secrets_dir.exists():
+    _datas.append((str(_secrets_dir), "secrets"))
+
 a = Analysis(
     ["main.py"],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=_datas,
+    hiddenimports=["googleapiclient.discovery"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

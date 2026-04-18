@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-import shutil
+import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Iterable
@@ -10,37 +12,62 @@ from .config import MAX_COPY_WORKERS
 from .models import FileCopyResult
 
 
-_CHUNK = 1024 * 1024
+_CHUNK = 4 * 1024 * 1024
 
 
-def sha256_file(path: Path) -> str:
+def sha256_file(path: Path, chunk_size: int = _CHUNK) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(_CHUNK), b""):
+        for chunk in iter(lambda: fh.read(chunk_size), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def copy_and_verify(source: Path, destination: Path) -> FileCopyResult:
+def copy_and_verify(
+    source: Path,
+    destination: Path,
+    chunk_size: int = _CHUNK,
+    on_chunk: Callable[[int], None] | None = None,
+) -> FileCopyResult:
+    """Stream source -> destination while hashing, then verify by re-reading destination.
+
+    `on_chunk(bytes_in_this_chunk)` fires on every chunk written for live progress.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        source_hash = sha256_file(source)
-        shutil.copy2(source, destination)
-        dest_hash = sha256_file(destination)
-        if source_hash != dest_hash:
+        h_src = hashlib.sha256()
+        with source.open("rb") as src, destination.open("wb") as dst:
+            while True:
+                chunk = src.read(chunk_size)
+                if not chunk:
+                    break
+                h_src.update(chunk)
+                dst.write(chunk)
+                if on_chunk:
+                    on_chunk(len(chunk))
+            dst.flush()
+            try:
+                os.fsync(dst.fileno())
+            except OSError:
+                pass
+
+        src_hash = h_src.hexdigest()
+        dst_hash = sha256_file(destination, chunk_size)
+
+        if src_hash != dst_hash:
             return FileCopyResult(
                 source=source,
                 destination=destination,
                 size_bytes=destination.stat().st_size,
-                sha256=dest_hash,
+                sha256=dst_hash,
                 success=False,
-                error=f"checksum mismatch: src={source_hash[:12]} dst={dest_hash[:12]}",
+                error=f"checksum mismatch: src={src_hash[:12]} dst={dst_hash[:12]}",
             )
         return FileCopyResult(
             source=source,
             destination=destination,
             size_bytes=destination.stat().st_size,
-            sha256=dest_hash,
+            sha256=dst_hash,
             success=True,
         )
     except Exception as exc:
@@ -54,29 +81,68 @@ def copy_and_verify(source: Path, destination: Path) -> FileCopyResult:
         )
 
 
-ProgressCallback = Callable[[FileCopyResult, int, int], None]
+FileProgressCallback = Callable[[FileCopyResult, int, int], None]
+BytesProgressCallback = Callable[[int, int], None]
 
 
 def run_copy_batch(
     pairs: list[tuple[Path, Path]],
-    progress: ProgressCallback | None = None,
+    progress: FileProgressCallback | None = None,
+    bytes_progress: BytesProgressCallback | None = None,
     max_workers: int = MAX_COPY_WORKERS,
 ) -> list[FileCopyResult]:
-    results: list[FileCopyResult] = []
-    total = len(pairs)
-    done = 0
+    """Copy `(src, dst)` pairs in parallel.
+
+    `progress(result, files_done, files_total)` fires once per file as it
+    finishes. `bytes_progress(bytes_done, bytes_total)` fires often during
+    each file's copy (throttled across the whole batch to ~10 Hz).
+    """
+    total_bytes = 0
+    for src, _ in pairs:
+        try:
+            total_bytes += src.stat().st_size
+        except OSError:
+            pass
+
+    bytes_done = [0]
+    bytes_lock = threading.Lock()
+    last_emit = [0.0]
+    emit_lock = threading.Lock()
+
+    def emit_bytes_throttled() -> None:
+        if not bytes_progress:
+            return
+        now = time.monotonic()
+        with emit_lock:
+            if now - last_emit[0] < 0.1:
+                return
+            last_emit[0] = now
+        bytes_progress(bytes_done[0], total_bytes)
+
+    def make_chunk_cb():
+        def cb(n: int) -> None:
+            with bytes_lock:
+                bytes_done[0] += n
+            emit_bytes_throttled()
+        return cb
+
+    results: list[FileCopyResult | None] = [None] * len(pairs)
+    files_done = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(copy_and_verify, src, dst): (src, dst)
-            for src, dst in pairs
-        }
-        for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
-            done += 1
+        future_to_idx = {}
+        for i, (src, dst) in enumerate(pairs):
+            fut = executor.submit(copy_and_verify, src, dst, _CHUNK, make_chunk_cb())
+            future_to_idx[fut] = i
+        for fut in as_completed(future_to_idx):
+            i = future_to_idx[fut]
+            results[i] = fut.result()
+            files_done += 1
             if progress:
-                progress(result, done, total)
-    return results
+                progress(results[i], files_done, len(pairs))
+
+    if bytes_progress:
+        bytes_progress(bytes_done[0], total_bytes)
+    return [r for r in results if r is not None]
 
 
 def write_checksums_file(results: Iterable[FileCopyResult], out_path: Path) -> None:

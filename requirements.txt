@@ -1,2 +1,5 @@
 PyQt6>=6.6
 psutil>=5.9
+gspread>=6.0
+google-auth>=2.20
+google-api-python-client>=2.100
