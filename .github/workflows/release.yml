@@ -1,0 +1,62 @@
+name: Build Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to build (e.g. v0.3.0)"
+        required: true
+        default: "v0.3.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install runtime + build deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Restore service-account credentials
+        shell: bash
+        env:
+          SA_JSON_B64: ${{ secrets.SA_JSON_B64 }}
+        run: |
+          mkdir -p secrets
+          echo "$SA_JSON_B64" | base64 --decode > secrets/sheet_service_account.json
+          test -s secrets/sheet_service_account.json
+          echo "wrote $(wc -c < secrets/sheet_service_account.json) bytes"
+
+      - name: Build with PyInstaller
+        run: python build.py
+
+      - name: List dist/
+        shell: bash
+        run: ls -la dist/
+
+      - name: Upload to the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "Uploading EgoCollect-win.zip to release $TAG"
+          gh release upload "$TAG" dist/EgoCollect-win.zip --clobber
