@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import queue
 import socket
 import sys
 import threading
@@ -9,7 +8,6 @@ import uuid as _uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
 
 
 try:
@@ -18,6 +16,9 @@ try:
     GSPREAD_AVAILABLE = True
 except ImportError:
     GSPREAD_AVAILABLE = False
+
+from .config import app_paths
+from .sync_outbox import SyncOutbox
 
 
 SHEET_NAME = "EgoCollect_Log"
@@ -75,43 +76,64 @@ class SyncStatus:
 
 
 class DriveSync:
-    """Background-threaded mirror of local manifest events to a Google Sheet."""
+    """Outbox-backed mirror of local manifest events to a shared Google Sheet.
+
+    Every push writes an entry to a persistent JSONL outbox first, then wakes
+    a background worker that drains the outbox to Google Drive. Offline pushes
+    are preserved across app restarts and replayed when connectivity returns.
+    """
+
+    RETRY_INTERVAL_SECONDS = 30.0
 
     def __init__(self):
         self._client = None
         self._spreadsheet = None
-        self._lock = threading.Lock()
-        self._queue: "queue.Queue" = queue.Queue()
+        self._remote_lock = threading.Lock()
+        self._outbox = SyncOutbox(app_paths().support_dir / "sync_outbox.jsonl")
+        self._wake = threading.Event()
         self._worker: threading.Thread | None = None
         self._stop = threading.Event()
         self.status = SyncStatus()
+        self.status.pending_jobs = self._outbox.count()
 
     def initialize(self) -> bool:
         if not GSPREAD_AVAILABLE:
-            self.status = SyncStatus(available=False, last_error="gspread not installed")
-            return False
-        creds_path = credentials_path()
-        if not creds_path.exists():
             self.status = SyncStatus(
                 available=False,
-                last_error=f"credentials not found at {creds_path}",
+                last_error="gspread not installed",
+                pending_jobs=self._outbox.count(),
             )
+            return False
+
+        connected = self._connect()
+        if self._worker is None:
+            self._worker = threading.Thread(target=self._run, daemon=True)
+            self._worker.start()
+        self._wake.set()
+        return connected
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def _connect(self) -> bool:
+        creds_path = credentials_path()
+        if not creds_path.exists():
+            self.status.available = False
+            self.status.last_error = f"credentials not found at {creds_path}"
             return False
         try:
             creds = Credentials.from_service_account_file(str(creds_path), scopes=SCOPES)
             self._client = gspread.authorize(creds)
             self._spreadsheet = self._client.open(SHEET_NAME)
             self._ensure_tabs()
-            self.status = SyncStatus(
-                available=True,
-                spreadsheet_id=self._spreadsheet.id,
-                last_sync_at=_now(),
-            )
-            self._worker = threading.Thread(target=self._run, daemon=True)
-            self._worker.start()
+            self.status.available = True
+            self.status.spreadsheet_id = self._spreadsheet.id
+            self.status.last_error = None
             return True
         except Exception as exc:
-            self.status = SyncStatus(available=False, last_error=f"{type(exc).__name__}: {exc}")
+            self.status.available = False
+            self.status.last_error = f"{type(exc).__name__}: {exc}"
             return False
 
     def _ensure_tabs(self) -> None:
@@ -133,24 +155,33 @@ class DriveSync:
                 if first_row != headers:
                     ws.update("A1", [headers])
 
-        if "Sheet1" in existing and {"SSDs", "Sessions", "Events"}.issubset(existing | {"SSDs", "Sessions", "Events"}):
-            try:
-                self._spreadsheet.del_worksheet(self._spreadsheet.worksheet("Sheet1"))
-            except Exception:
-                pass
-
-    def shutdown(self) -> None:
-        self._stop.set()
-        self._queue.put(None)
-
     def push_ssd(self, manifest: dict) -> None:
-        self._enqueue(("upsert_ssd", manifest))
+        self._outbox.append("upsert_ssd", {"manifest": manifest})
+        self.status.pending_jobs = self._outbox.count()
+        self._wake.set()
 
     def push_session(self, session_record: dict, ssd_uuid: str, ssd_name: str) -> None:
-        self._enqueue(("append_session", session_record, ssd_uuid, ssd_name))
+        self._outbox.append("append_session", {
+            "record": session_record,
+            "ssd_uuid": ssd_uuid,
+            "ssd_name": ssd_name,
+        })
+        self.status.pending_jobs = self._outbox.count()
+        self._wake.set()
 
     def push_event(self, event_type: str, ssd_uuid: str, ssd_name: str, payload: dict) -> None:
-        self._enqueue(("append_event", event_type, ssd_uuid, ssd_name, payload))
+        self._outbox.append("append_event", {
+            "event_type": event_type,
+            "ssd_uuid": ssd_uuid,
+            "ssd_name": ssd_name,
+            "payload": payload,
+        })
+        self.status.pending_jobs = self._outbox.count()
+        self._wake.set()
+
+    def sync_now(self) -> None:
+        """Force an immediate drain attempt (also retries the connection)."""
+        self._wake.set()
 
     def pull_all(self) -> dict:
         if not self.status.available or not self._spreadsheet:
@@ -163,40 +194,59 @@ class DriveSync:
             except Exception as exc:
                 self.status.last_error = f"pull {tab}: {exc}"
                 result[tab.lower()] = []
-        self.status.last_sync_at = _now()
         return result
-
-    def _enqueue(self, job: tuple) -> None:
-        if not self.status.available:
-            return
-        self._queue.put(job)
-        self.status.pending_jobs = self._queue.qsize()
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            try:
-                job = self._queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            if job is None:
+            self._wake.wait(timeout=self.RETRY_INTERVAL_SECONDS)
+            self._wake.clear()
+            if self._stop.is_set():
                 return
-            try:
-                self._dispatch(job)
-                self.status.last_sync_at = _now()
-                self.status.last_error = None
-            except Exception as exc:
-                self.status.last_error = f"{job[0]}: {type(exc).__name__}: {exc}"
-            finally:
-                self.status.pending_jobs = self._queue.qsize()
+            self._drain_outbox()
+            self.status.pending_jobs = self._outbox.count()
 
-    def _dispatch(self, job: tuple) -> None:
-        op = job[0]
+    def _drain_outbox(self) -> None:
+        pending = self._outbox.read_all()
+        if not pending:
+            return
+        if not self.status.available:
+            if not self._connect():
+                return
+        done: set[str] = set()
+        for entry in pending:
+            try:
+                self._dispatch(entry.get("op", ""), entry.get("args") or {})
+                done.add(entry["id"])
+            except Exception as exc:
+                self.status.available = False
+                self.status.last_error = (
+                    f"{entry.get('op')}: {type(exc).__name__}: {exc}"
+                )
+                break
+        if done:
+            self._outbox.remove_ids(done)
+            self.status.last_sync_at = _now()
+            if not self.status.last_error or self.status.available:
+                self.status.last_error = None
+
+    def _dispatch(self, op: str, args: dict) -> None:
         if op == "upsert_ssd":
-            self._upsert_ssd(job[1])
+            self._upsert_ssd(args.get("manifest") or {})
         elif op == "append_session":
-            self._append_session(job[1], job[2], job[3])
+            self._append_session(
+                args.get("record") or {},
+                args.get("ssd_uuid", ""),
+                args.get("ssd_name", ""),
+            )
         elif op == "append_event":
-            self._append_event(job[1], job[2], job[3], job[4])
+            self._append_event(
+                args.get("event_type", ""),
+                args.get("ssd_uuid", ""),
+                args.get("ssd_name", ""),
+                args.get("payload") or {},
+            )
+        else:
+            raise ValueError(f"unknown op: {op!r}")
 
     def _upsert_ssd(self, manifest: dict) -> None:
         from .device_info import size_bucket
@@ -226,7 +276,7 @@ class DriveSync:
             round(total_duration, 3) if total_duration else 0,
             last_event_type,
         ]
-        with self._lock:
+        with self._remote_lock:
             try:
                 cell = ws.find(ssd_uuid, in_column=1)
             except gspread.exceptions.CellNotFound:
@@ -258,7 +308,7 @@ class DriveSync:
             round(float(duration), 3) if duration else "",
             machine_name(),
         ]
-        with self._lock:
+        with self._remote_lock:
             ws.append_row(row, value_input_option="RAW")
 
     def _append_event(self, event_type: str, ssd_uuid: str, ssd_name: str, payload: dict) -> None:
@@ -272,7 +322,7 @@ class DriveSync:
             machine_name(),
             json.dumps(payload, default=str),
         ]
-        with self._lock:
+        with self._remote_lock:
             ws.append_row(row, value_input_option="RAW")
 
 

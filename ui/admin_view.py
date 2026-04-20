@@ -99,6 +99,9 @@ class DriveSyncCard(QGroupBox):
         )
         status_row.addWidget(self.chip)
         status_row.addStretch()
+        self.sync_btn = QPushButton("Sync now")
+        self.sync_btn.clicked.connect(self._on_sync_now)
+        status_row.addWidget(self.sync_btn)
         self.open_btn = QPushButton("Open Sheet")
         self.open_btn.clicked.connect(self._open_sheet)
         self.open_btn.setEnabled(False)
@@ -121,39 +124,66 @@ class DriveSyncCard(QGroupBox):
             )
             self.detail_label.setText("Authenticating with Google Drive…")
             self.open_btn.setEnabled(False)
+            self.sync_btn.setEnabled(False)
             return
 
+        pending = ds.status.pending_jobs
+        last_sync = _relative_time(ds.status.last_sync_at)
+
         if ds.status.available:
-            self.chip.setText("CONNECTED")
+            if pending:
+                self.chip.setText(f"SYNCING ({pending})")
+                chip_bg, chip_fg = "#fef3c7", "#92400e"
+            else:
+                self.chip.setText("SYNCED")
+                chip_bg, chip_fg = "#d1fae5", "#065f46"
             self.chip.setStyleSheet(
                 "padding: 3px 10px; border-radius: 10px; "
                 "font-size: 11px; font-weight: 600; "
-                "background: #d1fae5; color: #065f46;"
+                f"background: {chip_bg}; color: {chip_fg};"
             )
-            pending = ds.status.pending_jobs
-            last_sync = _relative_time(ds.status.last_sync_at)
-            extra = f"  ·  {pending} job(s) pending" if pending else ""
+            extra = f"  ·  {pending} event(s) waiting to upload" if pending else ""
             self.detail_label.setText(
                 f"Mirroring SSD registrations, copies, and clear events to "
-                f"<b>EgoCollect_Log</b>. Last sync: {last_sync}{extra}."
+                f"<b>EgoCollect_Log</b>. Last successful sync: {last_sync}{extra}."
             )
             self.open_btn.setEnabled(True)
+            self.sync_btn.setEnabled(True)
         else:
-            self.chip.setText("UNAVAILABLE")
+            if pending:
+                self.chip.setText(f"OFFLINE ({pending} queued)")
+            else:
+                self.chip.setText("OFFLINE")
             self.chip.setStyleSheet(
                 "padding: 3px 10px; border-radius: 10px; "
                 "font-size: 11px; font-weight: 600; "
                 "background: #fecaca; color: #991b1b;"
             )
-            self.detail_label.setText(
-                f"Drive sync is offline: {ds.status.last_error or 'unknown error'}."
-            )
-            self.open_btn.setEnabled(False)
+            err = ds.status.last_error or "no network / credentials not loaded"
+            if pending:
+                self.detail_label.setText(
+                    f"No connection to Drive — {err}. "
+                    f"{pending} event(s) are queued locally and will upload "
+                    f"automatically when the network returns. Click "
+                    f"<b>Sync now</b> to retry immediately."
+                )
+            else:
+                self.detail_label.setText(
+                    f"No connection to Drive — {err}. Events will be queued "
+                    f"locally and uploaded when the network returns."
+                )
+            self.open_btn.setEnabled(bool(ds.status.spreadsheet_id))
+            self.sync_btn.setEnabled(True)
 
     def _open_sheet(self):
         ds = self.app_state.drive_sync
         if ds and ds.status.spreadsheet_id:
             QDesktopServices.openUrl(QUrl(sheet_url(ds.status.spreadsheet_id)))
+
+    def _on_sync_now(self):
+        ds = self.app_state.drive_sync
+        if ds is not None:
+            ds.sync_now()
 
 
 class SSDRegistryCard(QGroupBox):
