@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ingest.ledger import load_ledger
+from ingest.media_info import format_duration, format_duration_hms
 from ingest.state import AppState
 
 
@@ -38,6 +39,12 @@ class _DrivePullWorker(QThread):
             self.finished_ok.emit(data)
         except Exception as exc:
             self.errored.emit(str(exc))
+
+
+_HEADERS = [
+    "SSD", "Date", "Mode", "Employee", "Task",
+    "Session", "Position", "Files", "Duration", "Size", "Machine",
+]
 
 
 class DashboardView(QWidget):
@@ -89,11 +96,8 @@ class DashboardView(QWidget):
         self.summary_label.setObjectName("MutedLabel")
         root.addWidget(self.summary_label)
 
-        self.table = QTableWidget(0, 10)
-        self.table.setHorizontalHeaderLabels([
-            "SSD", "Date", "Mode", "Employee", "Task",
-            "Session", "Position", "Files", "Size", "Machine",
-        ])
+        self.table = QTableWidget(0, len(_HEADERS))
+        self.table.setHorizontalHeaderLabels(_HEADERS)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
         root.addWidget(self.table, 1)
@@ -132,11 +136,23 @@ class DashboardView(QWidget):
         machines: set[str] = set()
         total_files = 0
         total_bytes = 0
+        total_duration = 0.0
         for s in sessions:
             ssd_names.add(str(s.get("ssd_name", "")))
             machines.add(str(s.get("machine", "")))
             total_files += int(s.get("file_count") or 0)
             total_bytes += int(s.get("total_bytes") or 0)
+            d = s.get("duration_seconds") or 0
+            try:
+                total_duration += float(d) if d != "" else 0
+            except (TypeError, ValueError):
+                pass
+            duration_cell = s.get("duration_hms") or ""
+            if not duration_cell and d:
+                try:
+                    duration_cell = format_duration_hms(float(d))
+                except (TypeError, ValueError):
+                    duration_cell = ""
             rows.append([
                 str(s.get("ssd_name", "")),
                 str(s.get("collection_date", "")),
@@ -146,6 +162,7 @@ class DashboardView(QWidget):
                 f"{int(s.get('session_number') or 0):03d}",
                 str(s.get("position") or ""),
                 str(int(s.get("file_count") or 0)),
+                duration_cell or "—",
                 _human(int(s.get("total_bytes") or 0)),
                 str(s.get("machine", "")),
             ])
@@ -153,8 +170,8 @@ class DashboardView(QWidget):
         self._fill_table(rows)
         self.summary_label.setText(
             f"Team view  ·  {len(ssd_names)} SSDs  ·  {len(rows)} sessions  ·  "
-            f"{total_files} files  ·  {_human(total_bytes)}  ·  "
-            f"{len(machines)} machine(s)"
+            f"{total_files} files  ·  {format_duration(total_duration)} of video  ·  "
+            f"{_human(total_bytes)}  ·  {len(machines)} machine(s)"
         )
 
     def _on_pull_error(self, msg: str) -> None:
@@ -167,6 +184,7 @@ class DashboardView(QWidget):
         rows: list[list[str]] = []
         total_files = 0
         total_bytes = 0
+        total_duration = 0.0
         ssd_count = 0
         for ssd_uuid, ssd in ledger.get("ssds", {}).items():
             ssd_count += 1
@@ -174,6 +192,11 @@ class DashboardView(QWidget):
             for s in ssd.get("sessions", []):
                 total_files += s.get("file_count", 0)
                 total_bytes += s.get("total_bytes", 0)
+                dur = s.get("total_duration_seconds") or 0
+                try:
+                    total_duration += float(dur)
+                except (TypeError, ValueError):
+                    pass
                 rows.append([
                     ssd_name,
                     s.get("collection_date", ""),
@@ -183,6 +206,7 @@ class DashboardView(QWidget):
                     f"{s.get('session_number', 0):03d}",
                     s.get("position") or "",
                     str(s.get("file_count", 0)),
+                    format_duration_hms(dur) if dur else "—",
                     _human(s.get("total_bytes", 0)),
                     "—",
                 ])
@@ -190,7 +214,8 @@ class DashboardView(QWidget):
         self._fill_table(rows)
         self.summary_label.setText(
             f"Local view  ·  {ssd_count} SSDs  ·  {len(rows)} sessions  ·  "
-            f"{total_files} files  ·  {_human(total_bytes)}"
+            f"{total_files} files  ·  {format_duration(total_duration)} of video  ·  "
+            f"{_human(total_bytes)}"
         )
 
     def _fill_table(self, rows: list[list[str]]) -> None:

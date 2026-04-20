@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .config import MAX_COPY_WORKERS
+from .media_info import mp4_duration_seconds
 from .models import FileCopyResult
 
 
@@ -63,12 +64,16 @@ def copy_and_verify(
                 success=False,
                 error=f"checksum mismatch: src={src_hash[:12]} dst={dst_hash[:12]}",
             )
+        duration = None
+        if destination.suffix.upper() == ".MP4":
+            duration = mp4_duration_seconds(destination)
         return FileCopyResult(
             source=source,
             destination=destination,
             size_bytes=destination.stat().st_size,
             sha256=dst_hash,
             success=True,
+            duration_seconds=duration,
         )
     except Exception as exc:
         return FileCopyResult(

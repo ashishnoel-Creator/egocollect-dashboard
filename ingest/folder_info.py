@@ -5,6 +5,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .media_info import format_duration, format_duration_hms, mp4_duration_seconds
+
 
 INFO_FILENAME = "info.json"
 
@@ -35,8 +37,8 @@ def update_folder_info(
 ) -> dict:
     """Create or update info.json by walking the emp folder for actual files.
 
-    Always re-walks the folder so the info reflects on-disk reality after the
-    copy, not a snapshot of the latest copy alone.
+    Also probes each MP4 for its duration and aggregates per-folder and
+    per-position totals.
     """
     lock = _lock_for(emp_folder)
     with lock:
@@ -49,6 +51,12 @@ def update_folder_info(
                 info = {}
         else:
             info = {}
+
+        # Load previous duration cache so we don't re-probe existing files
+        prev_durations: dict[str, float] = {}
+        for f in info.get("files", []):
+            if isinstance(f, dict) and f.get("path") and f.get("duration_seconds"):
+                prev_durations[f["path"]] = float(f["duration_seconds"])
 
         now = _now()
         if not info:
@@ -72,35 +80,53 @@ def update_folder_info(
 
         files: list[dict] = []
         total_bytes = 0
+        total_duration = 0.0
         by_position: dict[str, dict] = {}
         for f in sorted(emp_folder.rglob("*")):
             if not f.is_file():
                 continue
-            if f.name == INFO_FILENAME:
-                continue
-            if f.name == "checksums.sha256":
+            if f.name == INFO_FILENAME or f.name == "checksums.sha256":
                 continue
             try:
                 size = f.stat().st_size
             except OSError:
                 continue
             rel = f.relative_to(emp_folder).as_posix()
-            files.append({"path": rel, "bytes": size})
-            if f.suffix.upper() == ".MP4":
+            file_entry = {"path": rel, "bytes": size}
+            is_mp4 = f.suffix.upper() == ".MP4"
+            if is_mp4:
                 total_bytes += size
+                duration = prev_durations.get(rel)
+                if duration is None:
+                    duration = mp4_duration_seconds(f)
+                if duration and duration > 0:
+                    file_entry["duration_seconds"] = round(duration, 3)
+                    file_entry["duration"] = format_duration(duration)
+                    total_duration += duration
                 if is_three_cam:
                     parts = f.relative_to(emp_folder).parts
                     if len(parts) > 1:
                         pos = parts[0]
-                        bp = by_position.setdefault(pos, {"files": 0, "bytes": 0})
+                        bp = by_position.setdefault(
+                            pos, {"files": 0, "bytes": 0, "duration_seconds": 0.0},
+                        )
                         bp["files"] += 1
                         bp["bytes"] += size
+                        if duration and duration > 0:
+                            bp["duration_seconds"] += duration
+            files.append(file_entry)
 
         info["file_count"] = sum(1 for f in files if f["path"].lower().endswith(".mp4"))
         info["total_bytes"] = total_bytes
         info["total_gb"] = round(total_bytes / (1000 ** 3), 3)
+        info["total_duration_seconds"] = round(total_duration, 3)
+        info["total_duration"] = format_duration(total_duration)
+        info["total_duration_hms"] = format_duration_hms(total_duration)
         info["files"] = files
         if is_three_cam:
+            for pos, bp in by_position.items():
+                bp["duration_seconds"] = round(bp["duration_seconds"], 3)
+                bp["duration"] = format_duration(bp["duration_seconds"])
             info["by_position"] = by_position
         else:
             info.pop("by_position", None)

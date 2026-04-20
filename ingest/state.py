@@ -485,16 +485,28 @@ class AppState(QObject):
             machine=_machine(),
             is_three_cam=is_three_cam,
         )
+        from .media_info import format_duration as _fmt_dur
+        instance_duration = sum(
+            (r.duration_seconds or 0.0) for r in results if r.duration_seconds
+        )
+        inst.log_lines.append(
+            f"Copied {len(results)} files  ·  {_fmt_dur(instance_duration)} of video "
+            f"({_human(sum(r.size_bytes for r in results))})"
+        )
         inst.log_lines.append(
             f"info.json updated  ·  total in folder: "
             f"{info.get('file_count', 0)} files  ·  "
-            f"{info.get('total_gb', 0)} GB"
+            f"{info.get('total_gb', 0)} GB  ·  "
+            f"{info.get('total_duration', '—')}"
         )
 
         manifest: dict = {}
         for sd, pos in inst.sd_sources:
             target_dir = inst.target_dir(pos)
             per = [r for r in results if r.destination.parent == target_dir]
+            per_duration = sum(
+                (r.duration_seconds or 0.0) for r in per if r.duration_seconds
+            )
             rec = SessionRecord(
                 collection_date=inst.collection_date,
                 mode=inst.mode.value,
@@ -506,6 +518,9 @@ class AppState(QObject):
                 file_count=len(per),
                 total_bytes=sum(r.size_bytes for r in per),
                 created_at=datetime.now(timezone.utc).isoformat(),
+                total_duration_seconds=(
+                    round(per_duration, 3) if per_duration > 0 else None
+                ),
             )
             manifest = append_session(inst.ssd_root, rec)
 
@@ -519,6 +534,10 @@ class AppState(QObject):
             self.drive_sync.push_ssd(manifest)
             for s in manifest.get("sessions", [])[-len(inst.sd_sources):]:
                 self.drive_sync.push_session(s, ssd_uuid, ssd_name)
+            total_duration = sum(
+                (r.duration_seconds or 0.0) for r in results if r.duration_seconds
+            )
+            from .media_info import format_duration
             self.drive_sync.push_event(
                 "copy_session", ssd_uuid, ssd_name,
                 {
@@ -532,6 +551,8 @@ class AppState(QObject):
                     "total_gb": round(
                         sum(r.size_bytes for r in results) / (1000 ** 3), 3,
                     ),
+                    "total_duration_seconds": round(total_duration, 3),
+                    "total_duration": format_duration(total_duration),
                 },
             )
 

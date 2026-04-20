@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 
 from ingest.drive_sync import sheet_url
 from ingest.ledger import load_ledger
+from ingest.media_info import format_duration
 from ingest.state import AppState
 from ingest.version import GITHUB_REPO, VERSION
 
@@ -178,10 +179,10 @@ class SSDRegistryCard(QGroupBox):
         header.addWidget(refresh)
         layout.addLayout(header)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels([
             "Name", "Serial", "Capacity", "Sessions", "Data",
-            "Last seen", "State",
+            "Duration", "Last seen", "State",
         ])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
@@ -200,6 +201,7 @@ class SSDRegistryCard(QGroupBox):
 
         total_sessions = 0
         total_bytes = 0
+        total_duration = 0.0
         for i, (ssd_uuid, entry) in enumerate(
             sorted(ssds.items(), key=lambda kv: (kv[1].get("assigned_name") or "").lower())
         ):
@@ -209,6 +211,12 @@ class SSDRegistryCard(QGroupBox):
             sessions = entry.get("sessions", [])
             session_count = len(sessions)
             data_bytes = sum(s.get("total_bytes", 0) for s in sessions)
+            duration_s = 0.0
+            for s in sessions:
+                try:
+                    duration_s += float(s.get("total_duration_seconds") or 0)
+                except (TypeError, ValueError):
+                    pass
             last_seen = entry.get("last_seen_at")
 
             if ssd_uuid == locked_uuid:
@@ -218,6 +226,7 @@ class SSDRegistryCard(QGroupBox):
 
             total_sessions += session_count
             total_bytes += data_bytes
+            total_duration += duration_s
 
             values = [
                 name,
@@ -225,6 +234,7 @@ class SSDRegistryCard(QGroupBox):
                 _human(total) if total else "—",
                 str(session_count),
                 _human(data_bytes),
+                format_duration(duration_s),
                 _relative_time(last_seen),
                 state,
             ]
@@ -241,7 +251,8 @@ class SSDRegistryCard(QGroupBox):
         self.table.resizeColumnsToContents()
         self.summary_label.setText(
             f"{len(ssds)} SSDs tracked locally  ·  {total_sessions} sessions  ·  "
-            f"{_human(total_bytes)} archived"
+            f"{_human(total_bytes)} archived  ·  "
+            f"{format_duration(total_duration)} of video"
         )
 
 

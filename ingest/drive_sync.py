@@ -31,13 +31,16 @@ SSD_HEADERS = [
     "ssd_uuid", "assigned_name", "serial_number", "volume_uuid",
     "media_name", "capacity_label", "total_bytes", "registered_at",
     "last_seen_at", "last_seen_machine", "session_count",
-    "bytes_archived", "last_event_type",
+    "bytes_archived", "duration_hms_archived", "duration_seconds_archived",
+    "last_event_type",
 ]
 
 SESSION_HEADERS = [
     "created_at", "ssd_uuid", "ssd_name", "collection_date", "mode",
     "employee_id", "task_type", "session_number", "position",
-    "file_count", "total_bytes", "machine",
+    "file_count", "total_bytes",
+    "duration_hms", "duration_seconds",
+    "machine",
 ]
 
 EVENT_HEADERS = [
@@ -197,11 +200,15 @@ class DriveSync:
 
     def _upsert_ssd(self, manifest: dict) -> None:
         from .device_info import size_bucket
+        from .media_info import format_duration_hms
         ws = self._spreadsheet.worksheet("SSDs")
         ssd_uuid = manifest.get("ssd_uuid", "")
         sessions = manifest.get("sessions", []) or []
         events = manifest.get("events", []) or []
         last_event_type = events[-1].get("type") if events else ""
+        total_duration = sum(
+            float(s.get("total_duration_seconds") or 0) for s in sessions
+        )
         row = [
             ssd_uuid,
             manifest.get("assigned_name") or "",
@@ -215,6 +222,8 @@ class DriveSync:
             machine_name(),
             len(sessions),
             sum(int(s.get("total_bytes") or 0) for s in sessions),
+            format_duration_hms(total_duration),
+            round(total_duration, 3) if total_duration else 0,
             last_event_type,
         ]
         with self._lock:
@@ -230,7 +239,9 @@ class DriveSync:
                 ws.append_row(row, value_input_option="RAW")
 
     def _append_session(self, record: dict, ssd_uuid: str, ssd_name: str) -> None:
+        from .media_info import format_duration_hms
         ws = self._spreadsheet.worksheet("Sessions")
+        duration = record.get("total_duration_seconds")
         row = [
             record.get("created_at") or _now(),
             ssd_uuid,
@@ -243,6 +254,8 @@ class DriveSync:
             record.get("position") or "",
             int(record.get("file_count") or 0),
             int(record.get("total_bytes") or 0),
+            format_duration_hms(duration),
+            round(float(duration), 3) if duration else "",
             machine_name(),
         ]
         with self._lock:

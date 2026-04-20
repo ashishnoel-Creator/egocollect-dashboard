@@ -31,6 +31,7 @@ class FileCopyResult:
     sha256: str
     success: bool
     error: str | None = None
+    duration_seconds: float | None = None
 
 
 @dataclass
@@ -46,3 +47,4 @@ class SessionRecord:
     total_bytes: int
     created_at: str
     source_sd_label: str | None = None
+    total_duration_seconds: float | None = None
