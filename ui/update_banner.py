@@ -112,15 +112,34 @@ class UpdateDialog(QDialog):
         path = Path(path_str)
         try:
             if sys.platform == "darwin":
-                apply_mac_update(path)
-                self.accept()
-                QMessageBox.information(
-                    self.parent(), "Update downloaded",
-                    f"Version {self.info.latest_version} has been downloaded. "
-                    "Finder has opened the installer — drag the new "
-                    "EgoCollect into your Applications folder to replace "
-                    "the current version, then relaunch from Applications.",
+                if not is_frozen():
+                    QMessageBox.information(
+                        self.parent(), "Update downloaded",
+                        f"Saved to {path}. Running from source; install "
+                        "the DMG manually.",
+                    )
+                    self.accept()
+                    return
+                self.status_label.setText(
+                    "Installing… the app will quit and relaunch automatically."
                 )
+                silent = apply_mac_update(path)
+                self.accept()
+                if silent:
+                    QMessageBox.information(
+                        self.parent(), "Installing update",
+                        f"EgoCollect will quit now and relaunch as "
+                        f"{self.info.latest_version}. This takes about 5 "
+                        "seconds — no action needed.",
+                    )
+                    QApplication.instance().quit()
+                else:
+                    QMessageBox.information(
+                        self.parent(), "Update downloaded",
+                        f"Couldn't auto-install — Finder has opened the DMG. "
+                        "Quit EgoCollect, drag the new version into "
+                        "Applications, then relaunch.",
+                    )
             elif sys.platform == "win32":
                 if not is_frozen():
                     QMessageBox.information(

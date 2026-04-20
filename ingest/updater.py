@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import plistlib
 import re
+import shlex
 import ssl
 import subprocess
 import sys
@@ -116,8 +119,152 @@ def download_update(
         return None
 
 
-def apply_mac_update(dmg_path: Path) -> None:
-    subprocess.Popen(["open", str(dmg_path)])
+def apply_mac_update(dmg_path: Path) -> bool:
+    """Silent self-update on Mac.
+
+    Returns True if the update was staged and a background helper is now
+    waiting for the app to quit (caller should call QApplication.quit()).
+    Returns False if we can't do a silent install — in that case the DMG
+    is opened in Finder and the caller should show the legacy "drag to
+    Applications" dialog.
+    """
+    current_app = _current_app_bundle()
+    if current_app is None or not os.access(current_app.parent, os.W_OK):
+        subprocess.Popen(["open", str(dmg_path)])
+        return False
+
+    try:
+        mount_point, staged_app, staging_dir = _stage_app_from_dmg(dmg_path)
+    except Exception:
+        subprocess.Popen(["open", str(dmg_path)])
+        return False
+
+    parent_pid = os.getpid()
+    log_file = staging_dir / "apply_update.log"
+    helper = staging_dir / "apply_update.sh"
+
+    helper.write_text(_build_mac_helper_script(
+        log_file=log_file,
+        parent_pid=parent_pid,
+        current_app=current_app,
+        staged_app=staged_app,
+        staging_dir=staging_dir,
+    ))
+    helper.chmod(0o755)
+
+    subprocess.Popen(
+        ["/bin/bash", str(helper)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return True
+
+
+def _current_app_bundle() -> Path | None:
+    """If we're running from inside an `.app` bundle, return its path."""
+    exe = Path(sys.executable).resolve()
+    for ancestor in exe.parents:
+        if ancestor.suffix == ".app":
+            return ancestor
+    return None
+
+
+def _stage_app_from_dmg(dmg_path: Path) -> tuple[Path, Path, Path]:
+    """Mount the DMG, copy the first `.app` inside to a temp dir, detach."""
+    result = subprocess.run(
+        ["hdiutil", "attach", "-nobrowse", "-plist", str(dmg_path)],
+        capture_output=True, check=True, timeout=60,
+    )
+    data = plistlib.loads(result.stdout)
+    mount_point: Path | None = None
+    for entity in data.get("system-entities", []):
+        mp = entity.get("mount-point")
+        if mp:
+            mount_point = Path(mp)
+            break
+    if mount_point is None:
+        raise RuntimeError("failed to find DMG mount point")
+
+    staging_dir = Path(tempfile.mkdtemp(prefix="egocollect-update-"))
+    try:
+        apps = list(mount_point.glob("*.app"))
+        if not apps:
+            raise RuntimeError("no .app inside DMG")
+        source_app = apps[0]
+        staged_app = staging_dir / source_app.name
+        subprocess.run(
+            ["cp", "-R", str(source_app), str(staged_app)],
+            check=True, timeout=180,
+        )
+    finally:
+        subprocess.run(
+            ["hdiutil", "detach", str(mount_point), "-force"],
+            capture_output=True,
+        )
+    return mount_point, staged_app, staging_dir
+
+
+def _build_mac_helper_script(
+    log_file: Path,
+    parent_pid: int,
+    current_app: Path,
+    staged_app: Path,
+    staging_dir: Path,
+) -> str:
+    log_q = shlex.quote(str(log_file))
+    current_q = shlex.quote(str(current_app))
+    staged_q = shlex.quote(str(staged_app))
+    staging_q = shlex.quote(str(staging_dir))
+    app_name = current_app.name
+    fallback_q = shlex.quote(str(Path.home() / "Desktop" / app_name))
+    return f"""#!/bin/bash
+LOG={log_q}
+exec >> "$LOG" 2>&1
+PID_TO_WAIT={parent_pid}
+CURRENT={current_q}
+STAGED={staged_q}
+STAGING_DIR={staging_q}
+FALLBACK={fallback_q}
+
+echo "[$(date)] helper started; waiting for PID $PID_TO_WAIT"
+for i in $(seq 1 60); do
+  if ! kill -0 "$PID_TO_WAIT" 2>/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
+sleep 1
+
+echo "[$(date)] parent has exited, replacing app"
+if [ -d "$CURRENT" ]; then
+  rm -rf "$CURRENT"
+  if [ -e "$CURRENT" ]; then
+    echo "[$(date)] rm failed; falling back to Desktop install"
+    ditto "$STAGED" "$FALLBACK"
+    xattr -cr "$FALLBACK" 2>/dev/null || true
+    open "$FALLBACK"
+    exit 1
+  fi
+fi
+mv "$STAGED" "$CURRENT"
+if [ ! -d "$CURRENT" ]; then
+  echo "[$(date)] mv failed; falling back to Desktop install"
+  ditto "$STAGED" "$FALLBACK" 2>/dev/null || true
+  xattr -cr "$FALLBACK" 2>/dev/null || true
+  open "$FALLBACK"
+  exit 2
+fi
+
+xattr -cr "$CURRENT" 2>/dev/null || true
+echo "[$(date)] launching new version"
+open "$CURRENT"
+
+sleep 3
+rm -rf "$STAGING_DIR"
+echo "[$(date)] done"
+"""
 
 
 def apply_windows_update(zip_path: Path) -> None:
